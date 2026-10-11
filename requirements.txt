@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+edge-tts
+google-genai
+replicate
+requests
+pillow
+pydub
+
