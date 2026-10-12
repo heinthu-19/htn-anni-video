@@ -5,5 +5,3 @@ edge-tts
 google-genai
 requests
 pillow
-pydub
-pyjwt
