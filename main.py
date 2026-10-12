@@ -1,16 +1,18 @@
 import os
 import json
 import uuid
+import time
+import base64
 import asyncio
 import subprocess
 import requests
+import jwt
 from typing import Optional
 from fastapi import FastAPI, BackgroundTasks, Form, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import edge_tts
 from google import genai
-import replicate
 
 app = FastAPI(title="htn anni video")
 
@@ -24,17 +26,17 @@ app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-REPLICATE_TOKEN = os.getenv("REPLICATE_API_TOKEN", "")
+KLING_ACCESS_KEY = os.getenv("KLING_ACCESS_KEY", "")
+KLING_SECRET_KEY = os.getenv("KLING_SECRET_KEY", "")
+KLING_BASE_URL = "https://api.klingai.com/v1"
 
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-os.environ["REPLICATE_API_TOKEN"] = REPLICATE_TOKEN or ""
-
 db = {"tasks": {}}
 
 # --- ၁။ Gemini ဖြင့် မြန်မာဇာတ်ညွှန်း ရေးသားခြင်း ---
 def generate_burmese_story_script(story_prompt: str, char_desc: str):
     prompt = f"""
-အောက်ပါ ဇာတ်ကောင်နှင့် ဇာတ်လမ်း Prompt အပေါ် အခြေခံပြီး ၂ မိနစ်မှ ၃ မိနစ်ခန့် ကြာမြင့်မည့် မြန်မာစကားပြော ဇာတ်လမ်းပြောပြချက်ကို ရေးပေးပါ။
+အောက်ပါ ဇာတ်ကောင်နှင့် ဇာတ်လမ်း Prompt အပေါ် အခြေခံပြီး ၂ မိနစ်ခန့် ကြာမြင့်မည့် မြန်မာစကားပြော ဇာတ်လမ်းပြောပြချက်ကို ရေးပေးပါ။
 
 ဇာတ်ကောင် ဖော်ပြချက်: {char_desc}
 ဇာတ်လမ်း အကြောင်းအရာ: {story_prompt}
@@ -43,7 +45,7 @@ def generate_burmese_story_script(story_prompt: str, char_desc: str):
 ၁။ မြန်မာစာလုံးပေါင်း သတ်ပုံကို အတိအကျ သုံးပါ။ အင်္ဂလိပ်စာလုံး လုံးဝ မပါရပါ။
 ၂။ ဂဏန်းများကို စာဖြင့်သာ ရေးပါ (ဥပမာ- တစ်၊ နှစ်၊ သုံး)။
 ၃။ ဇာတ်ကောင်နာမည်၊ စင်တင်ညွှန်ကြားချက်များ လုံးဝ မထည့်ပါနှင့်။
-၄။ ရှင်းလင်းစွာ အသံထွက်နိုင်သော မြန်မာစကားလုံး ၃၀၀ မှ ၄၀၀ ကြား ရေးပေးပါ။
+၄။ ရှင်းလင်းစွာ အသံထွက်နိုင်သော မြန်မာစကားလုံး ၂၅၀ မှ ၃၅၀ ကြား ရေးပေးပါ။
 
 Return ONLY JSON:
 {{
@@ -72,111 +74,109 @@ async def generate_burmese_audio(text: str, output_path: str, voice_gender: str)
     communicate = edge_tts.Communicate(text, voice, rate="-4%")
     await communicate.save(output_path)
 
-# --- ၃။ Audio ကြာချိန် စစ်ဆေးခြင်း ---
-def get_media_duration(path: str) -> float:
+# --- ၃။ Kling AI JWT Token ထုတ်ယူခြင်း ---
+def get_kling_jwt_token(ak: str, sk: str) -> str:
+    headers = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "iss": ak,
+        "exp": int(time.time()) + 1800,
+        "nbf": int(time.time()) - 5
+    }
+    return jwt.encode(payload, sk, headers=headers)
+
+# --- ၄။ Kling AI ဖြင့် Video Generate လုပ်ခြင်း ---
+def run_kling_image_to_video(image_path: str, motion_prompt: str, output_video_path: str):
+    if not KLING_ACCESS_KEY or not KLING_SECRET_KEY:
+        raise Exception("KLING_ACCESS_KEY သို့မဟုတ် KLING_SECRET_KEY ထည့်သွင်းထားခြင်း မရှိသေးပါ။")
+
+    token = get_kling_jwt_token(KLING_ACCESS_KEY, KLING_SECRET_KEY)
+    url = f"{KLING_BASE_URL}/videos/image2video"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+
+    with open(image_path, "rb") as img_file:
+        img_b64 = base64.b64encode(img_file.read()).decode("utf-8")
+
+    payload = {
+        "model_name": "kling-v1",
+        "image": img_b64,
+        "prompt": motion_prompt,
+        "cfg_scale": 0.5,
+        "mode": "std",
+        "duration": 5
+    }
+
+    res = requests.post(url, headers=headers, json=payload, timeout=60).json()
+    if res.get("code") != 0:
+        raise Exception(f"Kling AI Error: {res.get('message')}")
+
+    task_id = res["data"]["task_id"]
+    query_url = f"{KLING_BASE_URL}/videos/image2video/{task_id}"
+
+    # Video render ပြီးသည်အထိ စောင့်ဆိုင်းခြင်း
+    max_retries = 35
+    for _ in range(max_retries):
+        time.sleep(10)
+        q_res = requests.get(query_url, headers=headers, timeout=60).json()
+        if q_res.get("code") != 0:
+            continue
+        status = q_res["data"]["task_status"]
+        if status == "succeed":
+            video_url = q_res["data"]["task_result"]["videos"][0]["url"]
+            v_download = requests.get(video_url, stream=True, timeout=120)
+            with open(output_video_path, "wb") as f:
+                for chunk in v_download.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            return output_video_path
+        elif status == "failed":
+            raise Exception(f"Kling Generation Failed: {q_res['data'].get('task_status_msg')}")
+
+    raise Exception("Kling AI Video Timeout ဖြစ်သွားပါသည် (အချိန်ကြာမြင့်လွန်းပါသည်)")
+
+# --- ၅။ ဗီဒီယိုနှင့် မြန်မာအသံဖိုင်ကို ပေါင်းစပ်ခြင်း (FFmpeg) ---
+def merge_video_with_audio(video_path: str, audio_path: str, final_output_path: str):
+    # Kling ဗီဒီယိုကို Loop ပတ်ပြီး မြန်မာအသံအပြည့်အစုံနှင့် ပေါင်းစပ်ပေးခြင်း
     cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", path
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return float(res.stdout.strip())
-
-# --- ၄။ Replicate ဖြင့် ၈ စက္ကန့် scene တစ်ခုချင်း Lip-Sync Render လုပ်ခြင်း ---
-def run_single_scene_lipsync(face_image_path: str, chunk_audio_path: str, output_chunk_video: str):
-    if not os.environ.get("REPLICATE_API_TOKEN"):
-        raise Exception("REPLICATE_API_TOKEN ထည့်သွင်းထားခြင်း မရှိသေးပါ။")
-
-    # အသစ်ဆုံးနှင့် အတည်ငြိမ်ဆုံး Replicate SadTalker Model Version
-    model_version = "lucataco/sadtalker:85c698db7c0a66d5011435d0191db323034e1da04b912a6d365833141b6a285b"
-    
-    with open(face_image_path, "rb") as img_file, open(chunk_audio_path, "rb") as aud_file:
-        output = replicate.run(
-            model_version,
-            input={
-                "source_image": img_file,
-                "driven_audio": aud_file,
-                "enhancer": "gfpgan",
-                "preprocess": "full",
-                "still": False
-            }
-        )
-
-    # Output ဗီဒီယို URL မှ ဒေါင်းလုဒ်ဆွဲခြင်း
-    video_url = str(output)
-    res = requests.get(video_url, stream=True, timeout=180)
-    with open(output_chunk_video, "wb") as f:
-        for chunk in res.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-# --- ၅။ ဗီဒီယို အပိုင်းများကို ပြန်ဆက်ခြင်း (FFmpeg Concat) ---
-def concatenate_scenes(video_list: list, output_final: str):
-    list_file_path = output_final.replace(".mp4", "_list.txt")
-    with open(list_file_path, "w") as f:
-        for v in video_list:
-            f.write(f"file '{os.path.abspath(v)}'\n")
-
-    cmd = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", list_file_path, "-c", "copy", output_final
+        "ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path,
+        "-i", audio_path, "-shortest", "-c:v", "copy", "-c:a", "aac",
+        final_output_path
     ]
     subprocess.run(cmd, check=True)
-    if os.path.exists(list_file_path):
-        os.remove(list_file_path)
 
 # --- Background Task Pipeline ---
 def run_video_pipeline(task_id: str, story_prompt: str, char_desc: str, char_image_path: str, voice_gender: str):
     try:
         db["tasks"][task_id]["status"] = "processing"
 
-        # အဆင့် ၁ - Script ရေးခြင်း
+        # အဆင့် ၁: ဇာတ်ညွှန်းရေးခြင်း
         db["tasks"][task_id]["message"] = "AI ဖြင့် မြန်မာဇာတ်ညွှန်းကို ရေးဖွဲ့နေပါသည်..."
         script_data = generate_burmese_story_script(story_prompt, char_desc)
         title = script_data.get("title", "AI Cartoon Story")
         narration = script_data.get("narration", story_prompt)
         db["tasks"][task_id]["title"] = title
 
-        # အဆင့် ၂ - အသံဖိုင်ထုတ်ခြင်း
-        db["tasks"][task_id]["message"] = "မြန်မာအသံထွက် Voiceover ကို ဖန်တီးနေပါသည်..."
-        full_audio_path = os.path.join(OUTPUT_DIR, f"{task_id}_speech.mp3")
-        asyncio.run(generate_burmese_audio(narration, full_audio_path, voice_gender))
+        # အဆင့် ၂: မြန်မာအသံထွက်ဖိုင် ထုတ်ခြင်း
+        db["tasks"][task_id]["message"] = "မြန်မာအသံထွက် Voiceover အသံဖိုင် ဖန်တီးနေပါသည်..."
+        audio_path = os.path.join(OUTPUT_DIR, f"{task_id}_speech.mp3")
+        asyncio.run(generate_burmese_audio(narration, audio_path, voice_gender))
 
-        total_audio_len = get_media_duration(full_audio_path)
-        scene_duration = 8.0  # ၈ စက္ကန့် scene တစ်ခုစီ ခွဲထုတ်ခြင်း
-        num_scenes = int(total_audio_len // scene_duration) + (1 if total_audio_len % scene_duration > 0 else 0)
+        # အဆင့် ၃: Kling AI ဖြင့် Video ဖန်တီးခြင်း
+        db["tasks"][task_id]["message"] = "Kling AI ဖြင့် Character ရုပ်ထွက်မြင့် Animation ထုတ်လုပ်နေပါသည် (၁-၂ မိနစ်ခန့် စောင့်ပါ)..."
+        kling_video_path = os.path.join(OUTPUT_DIR, f"{task_id}_kling.mp4")
+        motion_prompt = f"2.5D animation style, {char_desc}, character talking smoothly, consistent background, high quality anime cinematography"
+        run_kling_image_to_video(char_image_path, motion_prompt, kling_video_path)
 
-        rendered_scenes = []
-
-        # အဆင့် ၃ - ၈ စက္ကန့်စီ Scene တွေ ခွဲထုတ်ပြီး Lip-Sync ပြုလုပ်ခြင်း
-        for idx in range(num_scenes):
-            start_t = idx * scene_duration
-            db["tasks"][task_id]["message"] = f"Scene {idx+1}/{num_scenes} (၈ စက္ကန့်) ကို Character မျက်နှာဖြင့် Lip-Sync ဖန်တီးနေပါသည်..."
-
-            chunk_audio = os.path.join(OUTPUT_DIR, f"{task_id}_chunk_{idx}.mp3")
-            cmd_cut = [
-                "ffmpeg", "-y", "-ss", str(start_t), "-t", str(scene_duration),
-                "-i", full_audio_path, "-c", "copy", chunk_audio
-            ]
-            subprocess.run(cmd_cut, check=True)
-
-            chunk_video = os.path.join(OUTPUT_DIR, f"{task_id}_scene_{idx}.mp4")
-            run_single_scene_lipsync(char_image_path, chunk_audio, chunk_video)
-            rendered_scenes.append(chunk_video)
-
-            if os.path.exists(chunk_audio):
-                os.remove(chunk_audio)
-
-        # အဆင့် ၄ - Scene အားလုံးကို ဗီဒီယိုတစ်ခုတည်းအဖြစ် ဆက်ခြင်း
-        db["tasks"][task_id]["message"] = "၈ စက္ကန့် Scene အားလုံးကို အပြီးသတ် ဗီဒီယိုအဖြစ် ပေါင်းစပ်နေပါသည်..."
+        # အဆင့် ၄: အသံနှင့် ဗီဒီယို ပေါင်းစပ်ခြင်း
+        db["tasks"][task_id]["message"] = "မြန်မာအသံနှင့် ဗီဒီယိုကို ပေါင်းစပ်နေပါသည်..."
         final_video_name = f"{task_id}_final.mp4"
         final_video_path = os.path.join(OUTPUT_DIR, final_video_name)
-        concatenate_scenes(rendered_scenes, final_video_path)
+        merge_video_with_audio(kling_video_path, audio_path, final_video_path)
 
-        for v in rendered_scenes:
-            if os.path.exists(v):
-                os.remove(v)
-
+        # ပြီးဆုံးခြင်း
         db["tasks"][task_id]["status"] = "completed"
-        db["tasks"][task_id]["message"] = f"ဗီဒီယို အောင်မြင်စွာ ဖန်တီးပြီးပါပြီ! (စုစုပေါင်း {num_scenes} Scenes)"
+        db["tasks"][task_id]["message"] = "ဗီဒီယို အောင်မြင်စွာ ဖန်တီးပြီးပါပြီ!"
         db["tasks"][task_id]["result_url"] = f"/outputs/{final_video_name}"
 
     except Exception as e:
@@ -188,14 +188,14 @@ def run_video_pipeline(task_id: str, story_prompt: str, char_desc: str, char_ima
 async def create_video(
     background_tasks: BackgroundTasks,
     story_prompt: str = Form(...),
-    char_desc: str = Form(default="Main Anime Character"),
+    char_desc: str = Form(default="Anime character"),
     voice_gender: str = Form("male"),
     char_image: UploadFile = File(...)
 ):
     task_id = str(uuid.uuid4())[:8]
     ext = os.path.splitext(char_image.filename)[-1] or ".png"
     img_path = os.path.join(OUTPUT_DIR, f"{task_id}_character{ext}")
-    
+
     with open(img_path, "wb") as f:
         f.write(await char_image.read())
 
@@ -220,4 +220,3 @@ def get_task(task_id: str):
 @app.get("/", response_class=FileResponse)
 def index_page():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
-
