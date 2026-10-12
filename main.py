@@ -6,7 +6,6 @@ import base64
 import asyncio
 import subprocess
 import requests
-import jwt
 from typing import Optional
 from fastapi import FastAPI, BackgroundTasks, Form, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
@@ -26,8 +25,8 @@ app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-KLING_ACCESS_KEY = os.getenv("KLING_ACCESS_KEY", "")
-KLING_SECRET_KEY = os.getenv("KLING_SECRET_KEY", "")
+# Secret key နေရာတွင် အသစ်ရရှိထားသော token ကိုသာ တိုက်ရိုက်ထည့်သွင်းနိုင်ပါသည်
+KLING_API_KEY = os.getenv("KLING_ACCESS_KEY", "")
 KLING_BASE_URL = "https://api.klingai.com/v1"
 
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
@@ -74,26 +73,15 @@ async def generate_burmese_audio(text: str, output_path: str, voice_gender: str)
     communicate = edge_tts.Communicate(text, voice, rate="-4%")
     await communicate.save(output_path)
 
-# --- ၃။ Kling AI JWT Token ထုတ်ယူခြင်း ---
-def get_kling_jwt_token(ak: str, sk: str) -> str:
-    headers = {"alg": "HS256", "typ": "JWT"}
-    payload = {
-        "iss": ak,
-        "exp": int(time.time()) + 1800,
-        "nbf": int(time.time()) - 5
-    }
-    return jwt.encode(payload, sk, headers=headers)
-
-# --- ၄။ Kling AI ဖြင့် Video Generate လုပ်ခြင်း ---
+# --- ၃။ Kling AI ဖြင့် Video Generate လုပ်ခြင်း (JWT မလိုဘဲ Token တိုက်ရိုက်သုံးခြင်း) ---
 def run_kling_image_to_video(image_path: str, motion_prompt: str, output_video_path: str):
-    if not KLING_ACCESS_KEY or not KLING_SECRET_KEY:
-        raise Exception("KLING_ACCESS_KEY သို့မဟုတ် KLING_SECRET_KEY ထည့်သွင်းထားခြင်း မရှိသေးပါ။")
+    if not KLING_API_KEY:
+        raise Exception("KLING_ACCESS_KEY (API KEY) ထည့်သွင်းထားခြင်း မရှိသေးပါ။")
 
-    token = get_kling_jwt_token(KLING_ACCESS_KEY, KLING_SECRET_KEY)
     url = f"{KLING_BASE_URL}/videos/image2video"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
+        "Authorization": f"Bearer {KLING_API_KEY}"
     }
 
     with open(image_path, "rb") as img_file:
@@ -135,9 +123,8 @@ def run_kling_image_to_video(image_path: str, motion_prompt: str, output_video_p
 
     raise Exception("Kling AI Video Timeout ဖြစ်သွားပါသည် (အချိန်ကြာမြင့်လွန်းပါသည်)")
 
-# --- ၅။ ဗီဒီယိုနှင့် မြန်မာအသံဖိုင်ကို ပေါင်းစပ်ခြင်း (FFmpeg) ---
+# --- ၄။ ဗီဒီယိုနှင့် မြန်မာအသံဖိုင်ကို ပေါင်းစပ်ခြင်း (FFmpeg) ---
 def merge_video_with_audio(video_path: str, audio_path: str, final_output_path: str):
-    # Kling ဗီဒီယိုကို Loop ပတ်ပြီး မြန်မာအသံအပြည့်အစုံနှင့် ပေါင်းစပ်ပေးခြင်း
     cmd = [
         "ffmpeg", "-y", "-stream_loop", "-1", "-i", video_path,
         "-i", audio_path, "-shortest", "-c:v", "copy", "-c:a", "aac",
