@@ -83,20 +83,27 @@ def get_media_duration(path: str) -> float:
 
 # --- ၄။ Replicate ဖြင့် ၈ စက္ကန့် scene တစ်ခုချင်း Lip-Sync Render လုပ်ခြင်း ---
 def run_single_scene_lipsync(face_image_path: str, chunk_audio_path: str, output_chunk_video: str):
+    if not os.environ.get("REPLICATE_API_TOKEN"):
+        raise Exception("REPLICATE_API_TOKEN ထည့်သွင်းထားခြင်း မရှိသေးပါ။")
+
+    # အသစ်ဆုံးနှင့် အတည်ငြိမ်ဆုံး Replicate SadTalker Model Version
+    model_version = "lucataco/sadtalker:85c698db7c0a66d5011435d0191db323034e1da04b912a6d365833141b6a285b"
+    
     with open(face_image_path, "rb") as img_file, open(chunk_audio_path, "rb") as aud_file:
         output = replicate.run(
-            "cjwbw/sadtalker:3aa3fd9411082d7bc22246720d9f16dd19304e209f473edcec400f086f000112",
+            model_version,
             input={
                 "source_image": img_file,
                 "driven_audio": aud_file,
                 "enhancer": "gfpgan",
                 "preprocess": "full",
-                "still": False,
-                "expression_scale": 1.15
+                "still": False
             }
         )
 
-    res = requests.get(str(output), stream=True, timeout=120)
+    # Output ဗီဒီယို URL မှ ဒေါင်းလုဒ်ဆွဲခြင်း
+    video_url = str(output)
+    res = requests.get(video_url, stream=True, timeout=180)
     with open(output_chunk_video, "wb") as f:
         for chunk in res.iter_content(chunk_size=8192):
             f.write(chunk)
